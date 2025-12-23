@@ -1,0 +1,191 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Simple Laravel REST API on EC2 with RDS
+
+Parameters:
+  InstanceType:
+    Type: String
+    Default: t2.micro
+  LatestAmiId:
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: '/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2'
+  GitRepoUrl:
+    Type: String
+    Description: Public GitHub repo URL for your Laravel app (e.g., https://github.com/yourusername/simple-rest-api.git)
+  DBName:
+    Type: String
+    Default: laraveldb
+  DBUser:
+    Type: String
+    Default: admin
+  DBPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 8
+    Description: RDS master password (must be 8+ chars)
+
+Resources:
+  MyVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+
+  MySubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref MyVPC
+      CidrBlock: 10.0.0.0/24
+      MapPublicIpOnLaunch: true
+
+  MyInternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref MyVPC
+      InternetGatewayId: !Ref MyInternetGateway
+
+  MyRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref MyVPC
+
+  MyRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref MyRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref MyInternetGateway
+
+  MySubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref MySubnet
+      RouteTableId: !Ref MyRouteTable
+
+  EC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP and SSH
+      VpcId: !Ref MyVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0  # Restrict to your IP in production
+
+  RDSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow MySQL from EC2
+      VpcId: !Ref MyVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref EC2SecurityGroup
+
+  MyDB:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceClass: db.t3.micro
+      Engine: mysql
+      EngineVersion: 8.0
+      MultiAZ: false
+      StorageType: gp2
+      AllocatedStorage: 20
+      DBName: !Ref DBName
+      MasterUsername: !Ref DBUser
+      MasterUserPassword: !Ref DBPassword
+      VPCSecurityGroups:
+        - !Ref RDSSecurityGroup
+      PubliclyAccessible: false
+
+  MyEC2Instance:
+    Type: AWS::EC2::Instance
+    Metadata:
+      AWS::CloudFormation::Init:
+        config:
+          packages:
+            yum:
+              httpd: []
+              php: []  # PHP 7.2+ on AL2; for 8.1, add repos if needed
+              php-mbstring: []
+              php-xml: []
+              php-json: []
+              php-mysqlnd: []
+              mariadb: []  # MySQL client
+              git: []
+          commands:
+            01_install_composer:
+              command: |
+                curl -sS https://getcomposer.org/installer | php
+                mv composer.phar /usr/local/bin/composer
+            02_clone_repo:
+              command: !Sub |
+                git clone ${GitRepoUrl} /var/www/html/simple-rest-api
+            03_setup_laravel:
+              command: |
+                cd /var/www/html/simple-rest-api
+                composer install --no-dev --optimize-autoloader
+                cp .env.example .env
+                php artisan key:generate
+                chmod -R 755 storage
+                chown -R apache:apache storage bootstrap/cache
+            04_configure_env:
+              command: !Sub |
+                cd /var/www/html/simple-rest-api
+                sed -i "s/DB_CONNECTION=.*/DB_CONNECTION=mysql/" .env
+                sed -i "s/DB_HOST=.*/DB_HOST=${MyDB.Endpoint.Address}/" .env
+                sed -i "s/DB_PORT=.*/DB_PORT=3306/" .env
+                sed -i "s/DB_DATABASE=.*/DB_DATABASE=${DBName}/" .env
+                sed -i "s/DB_USERNAME=.*/DB_USERNAME=${DBUser}/" .env
+                sed -i "s/DB_PASSWORD=.*/DB_PASSWORD=${DBPassword}/" .env
+            05_migrate:
+              command: |
+                cd /var/www/html/simple-rest-api
+                php artisan migrate --force
+            06_apache_vhost:
+              command: |
+                echo '<VirtualHost *:80>
+                  DocumentRoot "/var/www/html/simple-rest-api/public"
+                  <Directory "/var/www/html/simple-rest-api/public">
+                    AllowOverride All
+                    Require all granted
+                  </Directory>
+                </VirtualHost>' > /etc/httpd/conf.d/laravel.conf
+          services:
+            sysvinit:
+              httpd:
+                enabled: true
+                ensureRunning: true
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: !Ref LatestAmiId
+      SecurityGroupIds:
+        - !Ref EC2SecurityGroup
+      SubnetId: !Ref MySubnet
+      IamInstanceProfile: !Ref InstanceProfile  # For cfn-init logging (optional, add if needed)
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          yum update -y
+          yum install -y aws-cfn-bootstrap
+          /opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource MyEC2Instance --region ${AWS::Region}
+          /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource MyEC2Instance --region ${AWS::Region}
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT15M
+    DependsOn: MyDB  # Ensure DB is ready before EC2 setup
+
+Outputs:
+  WebsiteURL:
+    Description: URL for the Laravel REST API
+    Value: !Sub http://${MyEC2Instance.PublicIp}/api/posts
+  EC2PublicIP:
+    Description: Public IP of EC2 instance (for SSH if needed)
+    Value: !Ref MyEC2Instance.PublicIp
